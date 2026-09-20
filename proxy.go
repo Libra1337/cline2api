@@ -230,19 +230,25 @@ type providerPin struct {
 //   - deepseek-v4.1-flash：两字段均被忽略 —— 上游原生走 DeepSeek 官方 API
 //     （响应带 provider_metadata.deepseek.promptCache* 官方特征），无需也无法 pin
 //   - cline-pass/deepseek-v4-pro：openai-compatible-private 私有通道（唯一出口），无需 pin
+//   - muse-spark-1.3-contributor：OpenRouter 管线，当前唯一 provider=meta（官方）。
+//     今天 pin 是 no-op，但若未来 OpenRouter 加第三方 provider，默认路由会悄悄打散缓存——固定住。
+//     实测：缓存预热慢（3+ 发）+ 随机驱逐；输出需 max_tokens≥512（加密思维链烧预算）。
 var modelProviderPins = map[string]providerPin{
-	"glm-5.3":       {field: "gateway", slug: "zai"},
-	"glm-5.3-flash": {field: "direct", slug: "z-ai"},
+	"glm-5.3":                    {field: "gateway", slug: "zai"},
+	"glm-5.3-flash":              {field: "direct", slug: "z-ai"},
+	"muse-spark-1.3-contributor": {field: "direct", slug: "meta"},
 }
 
-// lookupProviderPin 按完整模型 ID 或去掉 cline-pass/ 前缀后的 ID 查 pin。
+// lookupProviderPin 按完整模型 ID 或去掉 cline-pass/ / cline-free/ 前缀后的 ID 查 pin。
 func lookupProviderPin(model string) (providerPin, bool) {
 	if pin, ok := modelProviderPins[model]; ok {
 		return pin, true
 	}
-	if suffix, found := strings.CutPrefix(model, "cline-pass/"); found {
-		if pin, ok := modelProviderPins[suffix]; ok {
-			return pin, true
+	for _, prefix := range []string{"cline-pass/", "cline-free/"} {
+		if suffix, found := strings.CutPrefix(model, prefix); found {
+			if pin, ok := modelProviderPins[suffix]; ok {
+				return pin, true
+			}
 		}
 	}
 	return providerPin{}, false
@@ -1309,13 +1315,49 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		return nil, nil, fmt.Errorf("no active accounts available. Use --login or admin API to add accounts")
 	}
 	resp, picked, err := callClineAPIWithAccount(acc, params, stream)
-	if err != nil {
-		var unavailable *clineAccountUnavailableError
-		if errors.As(err, &unavailable) {
-			evictConversationAffinity(model, params)
-		}
+	if err == nil {
+		return resp, picked, err
+	}
+	var unavailable *clineAccountUnavailableError
+	if errors.As(err, &unavailable) {
+		evictConversationAffinity(model, params)
+	}
+	// 稳定性：官方端点（zai / deepseek / meta）思维链会烧尽小 max_tokens 预算，
+	// 上游以 500 "empty response content" 收场（流式请求同样在开流前以 500 状态返回，
+	// 可安全重试）。单次重试，max_tokens 提到 4 倍（封顶 8192），仍失败则原样上抛。
+	var apiErr *clineAPIError
+	if errors.As(err, &apiErr) && apiErr.statusCode == 500 &&
+		strings.Contains(apiErr.message, "empty response content") && bumpMaxTokensForRetry(params) {
+		log.Printf("  retry with bumped max_tokens=%v (empty response content)", params["max_tokens"])
+		return callClineAPIWithAccount(acc, params, stream)
 	}
 	return resp, picked, err
+}
+
+// bumpMaxTokensForRetry 空响应重试的预算提升：×4 封顶 8192。
+// 客户端未显式设置 max_tokens 时不重试（默认 128000 已足够，空响应另有原因）。
+func bumpMaxTokensForRetry(params map[string]any) bool {
+	cur := 0.0
+	switch v := params["max_tokens"].(type) {
+	case float64:
+		cur = v
+	case int:
+		cur = float64(v)
+	default:
+		return false
+	}
+	if cur <= 0 || cur >= 8192 {
+		return false
+	}
+	next := cur * 4
+	if next > 8192 {
+		next = 8192
+	}
+	if next <= cur {
+		return false
+	}
+	params["max_tokens"] = next
+	return true
 }
 
 func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Account, error) {

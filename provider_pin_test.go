@@ -45,7 +45,7 @@ func TestBuildUpstreamBodyDirectPin(t *testing.T) {
 // TestBuildUpstreamBodyClientPinWins: 客户端显式传入时不覆盖（保住 __probe__ 探测通路）
 func TestBuildUpstreamBodyClientPinWins(t *testing.T) {
 	body := buildUpstreamBody(map[string]any{
-		"model":            "cline-pass/glm-5.3",
+		"model":           "cline-pass/glm-5.3",
 		"providerOptions": map[string]any{"gateway": map[string]any{"only": []any{"__probe__"}}},
 	}, false)
 	gw, ok := body["providerOptions"].(map[string]any)
@@ -126,6 +126,39 @@ func TestLookupProviderPinBoundary(t *testing.T) {
 	}
 	if pin, ok := lookupProviderPin("cline-pass/glm-5.3"); !ok || pin.slug != "zai" {
 		t.Fatalf("glm-5.3 pin: ok=%v pin=%+v", ok, pin)
+	}
+	if pin, ok := lookupProviderPin("cline-free/muse-spark-1.3-contributor"); !ok || pin.field != "direct" || pin.slug != "meta" {
+		t.Fatalf("muse pin: ok=%v pin=%+v", ok, pin)
+	}
+}
+
+// TestBumpMaxTokensForRetry: 空响应重试的预算提升规则
+func TestBumpMaxTokensForRetry(t *testing.T) {
+	cases := []struct {
+		in   any
+		want float64
+		ok   bool
+	}{
+		{float64(128), 512, true},
+		{float64(512), 2048, true},
+		{float64(3000), 8192, true}, // ×4 超封顶 → 8192
+		{float64(8192), 0, false},   // 已达封顶不重试
+		{float64(0), 0, false},      // 未设置
+		{nil, 0, false},             // 无字段
+		{"512", 0, false},           // 非数值
+	}
+	for _, c := range cases {
+		params := map[string]any{}
+		if c.in != nil {
+			params["max_tokens"] = c.in
+		}
+		ok := bumpMaxTokensForRetry(params)
+		if ok != c.ok {
+			t.Fatalf("in=%v ok=%v want %v", c.in, ok, c.ok)
+		}
+		if ok && params["max_tokens"].(float64) != c.want {
+			t.Fatalf("in=%v bumped to %v want %v", c.in, params["max_tokens"], c.want)
+		}
 	}
 }
 
