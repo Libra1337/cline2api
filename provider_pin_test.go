@@ -117,8 +117,10 @@ func TestLookupProviderPinBoundary(t *testing.T) {
 	if _, ok := lookupProviderPin("cline-pass/glm-5.3x"); ok {
 		t.Fatal("suffix overshoot matched")
 	}
-	if _, ok := lookupProviderPin("other/glm-5.3"); ok {
-		t.Fatal("foreign prefix matched")
+	// 任意 "<vendor>/glm-5.3" 都视为 glm-5.3 本体（厂商前缀只影响 pin 前的显示形态，
+	// 真实流量实测：客户端发 z-ai/glm-5.3-flash 裸名，漏剥会导致 pin 不命中）
+	if _, ok := lookupProviderPin("moonshotai/kimi-k3"); ok {
+		t.Fatal("unrelated vendor-prefixed model should not match")
 	}
 	// deepseek-v4.1-flash 上游原生走 DeepSeek 官方 API，两字段均被忽略，不进 pin 表
 	if _, ok := lookupProviderPin("cline-pass/deepseek-v4.1-flash"); ok {
@@ -129,6 +131,17 @@ func TestLookupProviderPinBoundary(t *testing.T) {
 	}
 	if pin, ok := lookupProviderPin("cline-free/muse-spark-1.3-contributor"); !ok || pin.field != "direct" || pin.slug != "meta" {
 		t.Fatalf("muse pin: ok=%v pin=%+v", ok, pin)
+	}
+	// 厂商前缀裸名（客户端实际发送形态）：z-ai/glm-5.3-flash 必须命中 direct/z-ai pin，
+	// 漏剥会导致默认路由打散缓存
+	if pin, ok := lookupProviderPin("z-ai/glm-5.3-flash"); !ok || pin.field != "direct" || pin.slug != "z-ai" {
+		t.Fatalf("vendor-prefix pin miss: ok=%v pin=%+v", ok, pin)
+	}
+	if pin, ok := lookupProviderPin("deepseek/glm-5.3"); !ok || pin.slug != "zai" {
+		t.Fatalf("generic suffix pin miss: ok=%v pin=%+v", ok, pin)
+	}
+	if _, ok := lookupProviderPin("moonshotai/kimi-k3"); ok {
+		t.Fatal("unrelated vendor-prefixed model should not match")
 	}
 }
 

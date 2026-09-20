@@ -239,7 +239,9 @@ var modelProviderPins = map[string]providerPin{
 	"muse-spark-1.3-contributor": {field: "direct", slug: "meta"},
 }
 
-// lookupProviderPin 按完整模型 ID 或去掉 cline-pass/ / cline-free/ 前缀后的 ID 查 pin。
+// lookupProviderPin 按完整模型 ID 查 pin；未命中时依次尝试去掉
+// cline-pass/ / cline-free/ 前缀，以及任意厂商前缀（z-ai/、deepseek/、meta/ 等
+// "<vendor>/" 形态——客户端常发裸厂商前缀名，漏剥会导致 pin 不命中、默认路由打散缓存）。
 func lookupProviderPin(model string) (providerPin, bool) {
 	if pin, ok := modelProviderPins[model]; ok {
 		return pin, true
@@ -249,6 +251,11 @@ func lookupProviderPin(model string) (providerPin, bool) {
 			if pin, ok := modelProviderPins[suffix]; ok {
 				return pin, true
 			}
+		}
+	}
+	if _, suffix, found := strings.Cut(model, "/"); found && suffix != "" {
+		if pin, ok := modelProviderPins[suffix]; ok {
+			return pin, true
 		}
 	}
 	return providerPin{}, false
