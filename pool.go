@@ -252,7 +252,20 @@ func pickAccountLocked(p *AccountPool) *Account {
 	return acc
 }
 
+// tokenRefreshMu 保证同一时刻只有一个 token 刷新在飞（单飞）。
+// 并发突发下多个请求同时发现过期时：先到者刷新，其余等待后直接复用新 token；
+// 避免对同一 refreshToken 并发刷新（上游旋转 refresh token 时第二次必失败，账号会被误标 expired）。
+var tokenRefreshMu sync.Mutex
+
 func ensureAccountToken(acc *Account) (string, error) {
+	if acc.AccessToken != "" && time.Now().UnixMilli() < acc.ExpiresAt {
+		return acc.AccessToken, nil
+	}
+
+	tokenRefreshMu.Lock()
+	defer tokenRefreshMu.Unlock()
+
+	// 双重检查：等待期间可能已被并发请求刷新完成
 	if acc.AccessToken != "" && time.Now().UnixMilli() < acc.ExpiresAt {
 		return acc.AccessToken, nil
 	}

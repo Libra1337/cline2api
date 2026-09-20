@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -207,6 +209,214 @@ var passThroughKeys = []string{
 	"temperature", "top_p", "top_k", "stop", "presence_penalty", "frequency_penalty",
 	"response_format", "user", "n", "logit_bias", "seed", "logprobs", "top_logprobs",
 	"stream_options", "metadata",
+	// Provider 固定字段：客户端显式传入时透传上游（也用于 __probe__ 管线探测）
+	"providerOptions", "provider",
+}
+
+// providerPin 描述把一个 Cline Pass 模型固定到官方上游的方式。
+// Cline Pass 有两条路由管线，pin 字段不同且写错会被上游静默忽略（请求照常成功）：
+//   - Vercel / planner 管线：providerOptions.gateway.only
+//   - OpenRouter / direct 管线：provider.only
+// Z.AI 在两条管线里的 slug 不同：Vercel=zai，OpenRouter=z-ai，不可混用。
+type providerPin struct {
+	field string // "gateway" = providerOptions.gateway.only | "direct" = provider.only
+	slug  string // 上游 provider slug
+}
+
+// modelProviderPins 模型 → 官方上游固定映射。key 为去掉 cline-pass/ 前缀后的模型 ID。
+// 实测（__probe__ 双字段探测 + finalProvider 验证，2026-09-20）：
+//   - glm-5.3：Vercel 管线，gateway.only 生效，finalProvider=zai
+//   - glm-5.3-flash：OpenRouter 管线，provider.only 生效，响应顶层 provider=Z.AI
+//   - deepseek-v4.1-flash：两字段均被忽略 —— 上游原生走 DeepSeek 官方 API
+//     （响应带 provider_metadata.deepseek.promptCache* 官方特征），无需也无法 pin
+//   - cline-pass/deepseek-v4-pro：openai-compatible-private 私有通道（唯一出口），无需 pin
+var modelProviderPins = map[string]providerPin{
+	"glm-5.3":       {field: "gateway", slug: "zai"},
+	"glm-5.3-flash": {field: "direct", slug: "z-ai"},
+}
+
+// lookupProviderPin 按完整模型 ID 或去掉 cline-pass/ 前缀后的 ID 查 pin。
+func lookupProviderPin(model string) (providerPin, bool) {
+	if pin, ok := modelProviderPins[model]; ok {
+		return pin, true
+	}
+	if suffix, found := strings.CutPrefix(model, "cline-pass/"); found {
+		if pin, ok := modelProviderPins[suffix]; ok {
+			return pin, true
+		}
+	}
+	return providerPin{}, false
+}
+
+// routingInfo 从上游响应中提取实际路由结果（在 normalizeOpenAIResponse 剥离 metadata 之前调用）：
+//   - Vercel / planner 管线：provider_metadata.gateway.routing.finalProvider（顶层或 choices[0].message 内）
+//   - OpenRouter / direct 管线：响应顶层 provider 字段
+func routingInfo(obj map[string]any) (pipeline, provider string) {
+	candidates := []map[string]any{obj}
+	if choices, ok := obj["choices"].([]any); ok && len(choices) > 0 {
+		if c, ok := choices[0].(map[string]any); ok {
+			if msg, ok := c["message"].(map[string]any); ok {
+				candidates = append(candidates, msg)
+			}
+			if delta, ok := c["delta"].(map[string]any); ok {
+				candidates = append(candidates, delta)
+			}
+		}
+	}
+	for _, cand := range candidates {
+		for _, metaKey := range []string{"provider_metadata", "proxy_metadata"} {
+			if pm, _ := cand[metaKey].(map[string]any); pm != nil {
+				if gw, _ := pm["gateway"].(map[string]any); gw != nil {
+					if routing, _ := gw["routing"].(map[string]any); routing != nil {
+						if fp, _ := routing["finalProvider"].(string); fp != "" {
+							return "vercel/planner", fp
+						}
+					}
+				}
+			}
+		}
+	}
+	if p, _ := obj["provider"].(string); p != "" {
+		return "openrouter/direct", p
+	}
+	return "", ""
+}
+
+// ---- 会话粘性路由（缓存亲和）----
+// 上游 prompt 缓存按「账号 + 前缀」分桶：多账号轮询会让同一对话每一轮换桶，缓存全冷。
+// convAffinity 把「模型 + 对话前缀」粘到固定账号（滑动 TTL），同一对话始终命中同一账号的热缓存；
+// 新对话照常走轮询策略负载均衡。账号失效 / 请求失败时解绑，下一轮自动重选。
+const (
+	convAffinityTTL     = 45 * time.Minute
+	convAffinityMaxKeys = 8192
+)
+
+type convAffinityEntry struct {
+	AccountID string
+	Expires   time.Time
+}
+
+var (
+	convAffinityMu sync.Mutex
+	convAffinity   = map[string]convAffinityEntry{}
+)
+
+// stringContent 提取消息 content 的文本部分（string 或多段 parts 数组），用于派生稳定的对话指纹。
+func stringContent(v any) string {
+	switch c := v.(type) {
+	case string:
+		return c
+	case []any:
+		var b strings.Builder
+		for _, p := range c {
+			if pm, ok := p.(map[string]any); ok {
+				if t, ok := pm["text"].(string); ok {
+					b.WriteString(t)
+				}
+			}
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// conversationKey 由「模型 + 首条消息内容前 512 字节」派生：
+// 对话追加历史不改变首条消息 → 同一对话所有轮次得到相同 key。
+func conversationKey(model string, params map[string]any) string {
+	prefix := ""
+	if msgs, ok := params["messages"].([]any); ok && len(msgs) > 0 {
+		if m, ok := msgs[0].(map[string]any); ok {
+			prefix = stringContent(m["content"])
+		}
+	}
+	if len(prefix) > 512 {
+		prefix = prefix[:512]
+	}
+	sum := sha256.Sum256([]byte(model + "\x00" + prefix))
+	return fmt.Sprintf("%x", sum[:16])
+}
+
+// accountByIDActiveEligible：账号存在、active 且该模型未处于模型级冷却时返回它。
+func accountByIDActiveEligible(id, model string) *Account {
+	p := loadPool()
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	for _, a := range p.Accounts {
+		if a.AccountID == id && a.Status == "active" {
+			if until, cool := a.ModelCooldowns[model]; cool && time.Now().Before(until) {
+				return nil
+			}
+			return a
+		}
+	}
+	return nil
+}
+
+// sweepConvAffinityLocked 清理过期条目（调用方持有 convAffinityMu）。
+func sweepConvAffinityLocked() {
+	if len(convAffinity) <= convAffinityMaxKeys {
+		return
+	}
+	now := time.Now()
+	for k, e := range convAffinity {
+		if now.After(e.Expires) {
+			delete(convAffinity, k)
+		}
+	}
+}
+
+// pickAccountForConversation 粘性选号：亲和命中且账号健康 → 复用（滑动续期）；
+// 否则按既有策略选号并记录亲和。
+// 全程持有 convAffinityMu：同一对话的并发首拍只会选一次号，后续请求全部粘住同一账号
+// （否则并发竞态会把同一对话劈到不同账号，缓存当场碎片化）。
+func pickAccountForConversation(model string, params map[string]any) *Account {
+	key := conversationKey(model, params)
+	now := time.Now()
+
+	convAffinityMu.Lock()
+	defer convAffinityMu.Unlock()
+
+	if e, ok := convAffinity[key]; ok && now.Before(e.Expires) {
+		if acc := accountByIDActiveEligible(e.AccountID, model); acc != nil {
+			e.Expires = now.Add(convAffinityTTL)
+			convAffinity[key] = e
+			return acc
+		}
+		delete(convAffinity, key) // 账号失效/冷却，解绑重选
+	}
+	sweepConvAffinityLocked()
+
+	acc := pickAccountForModel(model)
+	if acc != nil {
+		convAffinity[key] = convAffinityEntry{AccountID: acc.AccountID, Expires: now.Add(convAffinityTTL)}
+	}
+	return acc
+}
+
+// evictConversationAffinity 账号故障时解除粘性，下一轮请求换号重试。
+func evictConversationAffinity(model string, params map[string]any) {
+	key := conversationKey(model, params)
+	convAffinityMu.Lock()
+	delete(convAffinity, key)
+	convAffinityMu.Unlock()
+}
+
+// maybeAliasToClinePass 裸名模型被 zen 判为付费时，若 Cline Pass 侧存在同名模型
+// （cline-pass/<id>），返回该别名；其余情况返回空串。
+// 场景：客户端发裸名 deepseek-v4.1-flash（该 ID 在 opencode 目录里是付费模型，会被直接拒绝），
+// 而订阅内 cline-pass/deepseek-v4.1-flash 可用 —— 回退改写而不是 400。
+func maybeAliasToClinePass(id string) string {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" || routeModel(trimmed) != "reject" {
+		return ""
+	}
+	alias := "cline-pass/" + strings.TrimPrefix(trimmed, "opencode/")
+	for _, m := range getAllModels() {
+		if m.ID == alias && m.Status == "active" {
+			return alias
+		}
+	}
+	return ""
 }
 
 type chatRequest struct {
@@ -391,6 +601,14 @@ func startProxy(host string, port int) error {
 			}
 		}
 
+		// 裸名付费 zen 模型回退到 Cline Pass 同名模型（如 deepseek-v4.1-flash → cline-pass/deepseek-v4.1-flash）
+		if alt := maybeAliasToClinePass(model); alt != "" {
+			log.Printf("  alias: %s -> %s (paid opencode, available via Cline Pass)", model, alt)
+			params["model"] = alt
+			model = alt
+			reqLog.Model = alt
+		}
+
 		// 按 model 自动分流：zen 免费模型 / zen 付费拒绝 / 其余走 Cline 池
 		switch routeModel(model) {
 		case "reject":
@@ -549,21 +767,421 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// ---- 上游请求体捕获（错误诊断用）----
+// 部分上游错误以 HTTP 200 + SSE error 事件返回，事后无处查看请求体。
+// 每条上游请求记录脱敏摘要（shape + content 类型 + base64 打码），流内错误时打印最后一条。
+var (
+	lastBodiesMu sync.Mutex
+	lastBodies   []string
+)
+
+// redactJSON 递归打码长 base64 / data URL，保留结构可读。
+func redactJSON(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, vv := range t {
+			out[k] = redactJSON(vv)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(t))
+		for _, vv := range t {
+			out = append(out, redactJSON(vv))
+		}
+		return out
+	case string:
+		if strings.HasPrefix(t, "data:") {
+			return fmt.Sprintf("<data-url %dB>", len(t))
+		}
+		if len(t) > 1024 {
+			// 仅当形似 base64（无空白的紧凑字符集）才标 b64，长普通文本标 str
+			compact := true
+			for _, r := range t {
+				if r == ' ' || r == '\n' || r == '\t' || r == '\r' {
+					compact = false
+					break
+				}
+			}
+			if compact {
+				return fmt.Sprintf("<b64 %dB>", len(t))
+			}
+			return fmt.Sprintf("<str %dB> %.60s...", len(t), t[:min(60, len(t))])
+		}
+		return t
+	}
+	return v
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func recordUpstreamBody(body map[string]any) {
+	red := redactJSON(body["messages"])
+	b, err := json.Marshal(red)
+	if err != nil {
+		return
+	}
+	const maxLen = 4000
+	s := string(b)
+	if len(s) > maxLen {
+		s = s[:maxLen] + "...(truncated)"
+	}
+	lastBodiesMu.Lock()
+	lastBodies = append(lastBodies, s)
+	if len(lastBodies) > 10 {
+		lastBodies = lastBodies[len(lastBodies)-10:]
+	}
+	lastBodiesMu.Unlock()
+}
+
+func dumpLastBody() {
+	lastBodiesMu.Lock()
+	defer lastBodiesMu.Unlock()
+	if len(lastBodies) == 0 {
+		return
+	}
+	log.Printf("  last upstream body (redacted): %s", lastBodies[len(lastBodies)-1])
+}
+
+// normalizeMessageParts 把漏进 OpenAI 请求体的 Anthropic 形态 content 块翻译成合法 parts
+// （new-api 等转换层会原样漏出 image/tool_result/tool_use/thinking/document 等块，
+// 上游对未知 part 类型一律 400 Invalid input）。
+// 返回 (新消息, 提取出的 tool_use 调用, 是否有改动)。
+func normalizeMessageParts(msg map[string]any) (map[string]any, []any, bool) {
+	arr, ok := msg["content"].([]any)
+	if !ok {
+		return msg, nil, false
+	}
+	role, _ := msg["role"].(string)
+	changed := false
+	out := make([]any, 0, len(arr))
+	var toolCalls []any
+	var toolResults []any // user 消息里漏出的 tool_result 块（由 cleanMessages 编排处理）
+	for _, p := range arr {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			out = append(out, p)
+			continue
+		}
+		switch pm["type"] {
+		case "text":
+			out = append(out, pm)
+		case "image_url":
+			// 字符串简写形态：{"type":"image_url","image_url":"data:..."} → 对象形态
+			if s, ok := pm["image_url"].(string); ok {
+				out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"url": s}})
+				changed = true
+				continue
+			}
+			if iu, ok := pm["image_url"].(map[string]any); ok {
+				// detail 显式 null（部分客户端如此发送）会被上游 400 拒绝 —— 剥除；
+				// detail 为合法字符串值时保留
+				if d, present := iu["detail"]; present && d == nil {
+					ciu := make(map[string]any, len(iu))
+					for k, v := range iu {
+						ciu[k] = v
+					}
+					delete(ciu, "detail")
+					cpm := make(map[string]any, len(pm))
+					for k, v := range pm {
+						cpm[k] = v
+					}
+					cpm["image_url"] = ciu
+					out = append(out, cpm)
+					changed = true
+					continue
+				}
+			}
+			out = append(out, pm)
+		case "image":
+			if src, ok := pm["source"].(map[string]any); ok {
+				if u := anthropicImageURL(src); u != "" {
+					out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+					changed = true
+					continue
+				}
+			}
+			changed = true // 无法解析的图片块 → 丢弃
+		case "tool_result":
+			if role == "user" {
+				changed = true
+				toolResults = append(toolResults, pm)
+			} else {
+				out = append(out, pm)
+			}
+		case "tool_use":
+			// 漏进 content 的 tool_use 块 → 提升为消息级 tool_calls
+			changed = true
+			argsStr := "{}"
+			if input, ok := pm["input"]; ok && input != nil {
+				if s, ok := input.(string); ok {
+					argsStr = s
+				} else if b, err := json.Marshal(input); err == nil {
+					argsStr = string(b)
+				}
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"id":       pm["id"],
+				"type":     "function",
+				"function": map[string]any{"name": pm["name"], "arguments": argsStr},
+			})
+		case "thinking", "redacted_thinking":
+			changed = true // 丢弃
+		case "document":
+			changed = true
+			mt := ""
+			if src, ok := pm["source"].(map[string]any); ok {
+				if v, _ := src["media_type"].(string); v != "" {
+					mt = v
+				}
+			}
+			out = append(out, map[string]any{"type": "text", "text": "[document attached: " + mt + "]"})
+		default:
+			// 未知块类型 → 文本占位，保结构合法
+			changed = true
+			out = append(out, map[string]any{"type": "text", "text": fmt.Sprintf("[unsupported block: %v]", pm["type"])})
+		}
+	}
+	if !changed {
+		return msg, nil, false
+	}
+	cp := make(map[string]any, len(msg)+1)
+	for k, v := range msg {
+		cp[k] = v
+	}
+	switch {
+	case len(out) == 0 && (len(toolCalls) > 0 || len(toolResults) > 0):
+		cp["content"] = ""
+	case len(out) == 0:
+		cp["content"] = " "
+	default:
+		cp["content"] = out
+	}
+	if len(toolCalls) > 0 {
+		cp["tool_calls"] = toolCalls
+	}
+	if len(toolResults) > 0 {
+		cp["__leaked_tool_results"] = toolResults // 内部标记，cleanMessages 消费后移除
+	}
+	return cp, toolCalls, true
+}
+
+// toolResultToMessages 把漏出的 tool_result 块转成 role:tool 消息（配对前一条 assistant 的 tool_calls）
+// 或（无配对时）文本占位 parts。
+func toolResultToMessages(blocks []any, callIDSet map[string]bool) ([]any, []any) {
+	var toolMsgs, fallbackParts []any
+	for _, b := range blocks {
+		bm, _ := b.(map[string]any)
+		if bm == nil {
+			continue
+		}
+		id, _ := bm["tool_use_id"].(string)
+		if id != "" && callIDSet[id] {
+			content := ""
+			images := []any{}
+			switch c := bm["content"].(type) {
+			case string:
+				content = c
+			case []any:
+				texts := []string{}
+				for _, pb := range c {
+					if pm, ok := pb.(map[string]any); ok {
+						switch pm["type"] {
+						case "text":
+							if t, ok := pm["text"].(string); ok {
+								texts = append(texts, t)
+							}
+						case "image":
+							if src, ok := pm["source"].(map[string]any); ok {
+								if u := anthropicImageURL(src); u != "" {
+									images = append(images, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+								}
+							}
+						}
+					}
+				}
+				content = strings.Join(texts, "\n")
+			}
+			toolMsgs = append(toolMsgs, map[string]any{
+				"role": "tool", "tool_call_id": id, "content": content,
+			})
+			fallbackParts = append(fallbackParts, images...) // 图片不能进 tool 消息，并入后续 user content
+			continue
+		}
+		fallbackParts = append(fallbackParts, toolResultBlockToParts(bm)...)
+	}
+	return toolMsgs, fallbackParts
+}
+
+// toolResultBlockToParts 把无配对的 tool_result 块降级为 text + image_url parts。
+func toolResultBlockToParts(tr map[string]any) []any {
+	parts := []any{}
+	switch c := tr["content"].(type) {
+	case string:
+		parts = append(parts, map[string]any{"type": "text", "text": "[tool_result] " + c})
+	case []any:
+		texts := []string{}
+		for _, b := range c {
+			bm, ok := b.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch bm["type"] {
+			case "text":
+				if t, ok := bm["text"].(string); ok {
+					texts = append(texts, t)
+				}
+			case "image":
+				if src, ok := bm["source"].(map[string]any); ok {
+					if u := anthropicImageURL(src); u != "" {
+						parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+					}
+				}
+			}
+		}
+		label := "[tool_result]"
+		if len(texts) > 0 {
+			label += " " + strings.Join(texts, "\n")
+		}
+		parts = append([]any{map[string]any{"type": "text", "text": label}}, parts...)
+	default:
+		parts = append(parts, map[string]any{"type": "text", "text": "[tool_result]"})
+	}
+	return parts
+}
+
 func cleanMessages(messages []any) []any {
 	cleaned := make([]any, 0, len(messages))
+	// 上一条 assistant 消息的 tool_call id 集合（用于把漏出的 tool_result 配对成 role:tool 消息）
+	prevCallIDs := map[string]bool{}
+
+	callIDSet := func(msg map[string]any) map[string]bool {
+		set := map[string]bool{}
+		if tcs, ok := msg["tool_calls"].([]any); ok {
+			for _, tc := range tcs {
+				if tcm, ok := tc.(map[string]any); ok {
+					if id, ok := tcm["id"].(string); ok && id != "" {
+						set[id] = true
+					}
+				}
+			}
+		}
+		return set
+	}
+
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			cleaned = append(cleaned, m)
 			continue
 		}
+		// 上游校验比 OpenAI 严（实测边界）：
+		//   - content 空数组 []            → 400 Invalid input（任何角色）
+		//   - user / tool 角色 content ""  → 400 Invalid input
+		//   - assistant 角色 content ""    → 合法
+		//   - user / tool 角色 content " " → 合法
+		//   - 任何未知 part 类型（Anthropic 块泄漏等）→ 400 Invalid input
+		role, _ := msg["role"].(string)
+
+		if _, isArr := msg["content"].([]any); isArr {
+			nm, _, changed := normalizeMessageParts(msg)
+			// 消费内部标记：漏出的 tool_result 块
+			var leaked []any
+			if lv, ok := nm["__leaked_tool_results"].([]any); ok {
+				leaked = lv
+				delete(nm, "__leaked_tool_results")
+			}
+			if len(leaked) > 0 {
+				toolMsgs, extraParts := toolResultToMessages(leaked, prevCallIDs)
+				cleaned = append(cleaned, toolMsgs...)
+				// 剩余 parts（含 tool_result 里的图片）并入本条消息 content
+				if len(extraParts) > 0 {
+					cur, _ := nm["content"].([]any)
+					nm["content"] = append(cur, extraParts...)
+				}
+				changed = true
+			}
+			// content 可能被清成空数组（全部是 tool_result 时）
+			if arr, _ := nm["content"].([]any); len(arr) == 0 {
+				if nm["role"] == "assistant" {
+					nm["content"] = ""
+				} else {
+					nm["content"] = " "
+				}
+			}
+			if changed {
+				prevCallIDs = callIDSet(nm)
+				cleaned = append(cleaned, nm)
+				continue
+			}
+			prevCallIDs = callIDSet(msg)
+			cleaned = append(cleaned, msg)
+			continue
+		}
+
+		if s, ok := msg["content"].(string); ok && s == "" && (role == "user" || role == "tool") {
+			cp := make(map[string]any, len(msg))
+			for k, v := range msg {
+				cp[k] = v
+			}
+			cp["content"] = " "
+			cleaned = append(cleaned, cp)
+			prevCallIDs = map[string]bool{}
+			continue
+		}
+		prevCallIDs = callIDSet(msg)
 		cleaned = append(cleaned, msg)
 	}
 	return cleaned
 }
 
+// logMessageShapes 上游 400 时打印每条消息的 content 形状（role + 类型 + parts 构成），
+// 用于定位"Invalid input, param=messages.N.content"类校验错误的真实来源。
+func logMessageShapes(body map[string]any) {
+	msgs, _ := body["messages"].([]any)
+	var b strings.Builder
+	for i, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			fmt.Fprintf(&b, " [%d:non-obj]", i)
+			continue
+		}
+		role, _ := mm["role"].(string)
+		switch c := mm["content"].(type) {
+		case string:
+			fmt.Fprintf(&b, " [%d:%s str=%d]", i, role, len(c))
+		case []any:
+			types := make([]string, 0, len(c))
+			for _, p := range c {
+				if pm, ok := p.(map[string]any); ok {
+					if t, _ := pm["type"].(string); t != "" {
+						types = append(types, t)
+					} else {
+						types = append(types, "?")
+					}
+				}
+			}
+			fmt.Fprintf(&b, " [%d:%s parts=%v]", i, role, types)
+		case nil:
+			fmt.Fprintf(&b, " [%d:%s nil]", i, role)
+		default:
+			fmt.Fprintf(&b, " [%d:%s %T]", i, role, c)
+		}
+	}
+	log.Printf("  upstream 400 body shapes:%s", b.String())
+}
+
+// sessionSeq 保证并发突发下 session_id 全局唯一（毫秒时间戳在高并发下会碰撞，
+// 上游若按 task 归并状态，碰撞就是串扰源）。
+var sessionSeq atomic.Int64
+
 func buildUpstreamBody(params map[string]any, stream bool) map[string]any {
-	sessionID := fmt.Sprintf("sess_%d", time.Now().UnixMilli())
+	sessionID := fmt.Sprintf("sess_%d_%d", time.Now().UnixMilli(), sessionSeq.Add(1))
 
 	maxTokens := defaultMaxTokens
 	if mt, ok := params["max_tokens"].(float64); ok {
@@ -605,6 +1223,24 @@ func buildUpstreamBody(params map[string]any, stream bool) map[string]any {
 	for _, key := range passThroughKeys {
 		if val, ok := params[key]; ok {
 			body[key] = val
+		}
+	}
+
+	// Provider pin：客户端显式传入 providerOptions / provider 时以其为准（保住 __probe__ 探测通路），
+	// 否则按模型映射表注入，把指定模型固定到官方上游。
+	if _, hasGateway := body["providerOptions"].(map[string]any); !hasGateway {
+		if _, hasDirect := body["provider"].(map[string]any); !hasDirect {
+			if pin, ok := lookupProviderPin(model); ok {
+				switch pin.field {
+				case "gateway":
+					body["providerOptions"] = map[string]any{
+						"gateway": map[string]any{"only": []string{pin.slug}},
+					}
+				case "direct":
+					body["provider"] = map[string]any{"only": []string{pin.slug}}
+				}
+				log.Printf("  provider pin: model=%s field=%s slug=%s", model, pin.field, pin.slug)
+			}
 		}
 	}
 
@@ -667,11 +1303,19 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		return callFreeClineAPI(params, stream)
 	}
 
-	acc := pickAccountForModel(model)
+	// 会话粘性：同一对话固定同一账号，保住该账号上的上游 prompt 缓存
+	acc := pickAccountForConversation(model, params)
 	if acc == nil {
 		return nil, nil, fmt.Errorf("no active accounts available. Use --login or admin API to add accounts")
 	}
-	return callClineAPIWithAccount(acc, params, stream)
+	resp, picked, err := callClineAPIWithAccount(acc, params, stream)
+	if err != nil {
+		var unavailable *clineAccountUnavailableError
+		if errors.As(err, &unavailable) {
+			evictConversationAffinity(model, params)
+		}
+	}
+	return resp, picked, err
 }
 
 func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Account, error) {
@@ -729,6 +1373,7 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 	}
 	log.Printf("  upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
 		truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
+	recordUpstreamBody(body)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -769,6 +1414,9 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		bodyStr := string(bodyBytes)
+		if resp.StatusCode == 400 {
+			logMessageShapes(body)
+		}
 		// 429：模型级冷却 —— 只暂停该模型，账号保持可用，其他模型继续转发
 		if resp.StatusCode == 429 {
 			model, _ := body["model"].(string)
@@ -1137,6 +1785,7 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, acc *A
 	reader := bufio.NewReader(upstream.Body)
 	var latestUsage tokenUsage
 	var firstOutputAt time.Time
+	lastRouteLog := ""
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -1161,6 +1810,17 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, acc *A
 			// Try to normalize the response
 			var obj map[string]any
 			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+				// 上游部分错误以 HTTP 200 + SSE error 事件返回（如 stream_initialization_failed），
+				// 不打日志就完全不可见；同时 dump 脱敏请求体定位非法 content 形态
+				if e, ok := obj["error"]; ok {
+					log.Printf("  upstream stream error: %s", truncate(fmt.Sprint(e), 200))
+					dumpLastBody()
+				}
+				// 在 normalize 剥离 metadata 之前抓实际路由结果
+				if pl, prov := routingInfo(obj); prov != "" && pl+"/"+prov != lastRouteLog {
+					lastRouteLog = pl + "/" + prov
+					log.Printf("  upstream routing: pipeline=%s provider=%s", pl, prov)
+				}
 				// Some Cline responses wrap in {data: {...}}
 				if data, ok := obj["data"]; ok {
 					if d, ok := data.(map[string]any); ok {
@@ -1240,6 +1900,14 @@ func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, acc
 		}
 	}
 
+	// 在 normalize 剥离 metadata 之前抓实际路由结果（wrapper 内外都查）
+	for _, candidate := range []map[string]any{raw, out} {
+		if pl, prov := routingInfo(candidate); prov != "" {
+			log.Printf("  upstream routing: pipeline=%s provider=%s", pl, prov)
+			break
+		}
+	}
+
 	out = normalizeOpenAIResponse(out)
 	usage := parseTokenUsage(out["usage"])
 	recordTokenUsage(acc, reqLog.Model, usage)
@@ -1299,6 +1967,28 @@ func loadOverrideContent() string {
 		log.Printf("  override.md is empty")
 	}
 	return content
+}
+
+// anthropicImageURL 把 Anthropic image source 转成 OpenAI image_url 的 url 字段：
+// base64 源 → data:<media_type>;base64,<data>；url 源 → 原样返回；不认识的形态返回空串。
+func anthropicImageURL(src map[string]any) string {
+	switch src["type"] {
+	case "base64":
+		mt, _ := src["media_type"].(string)
+		data, _ := src["data"].(string)
+		if data == "" {
+			return ""
+		}
+		if mt == "" {
+			mt = "image/png"
+		}
+		return "data:" + mt + ";base64," + data
+	case "url":
+		if u, ok := src["url"].(string); ok && u != "" {
+			return u
+		}
+	}
+	return ""
 }
 
 func extractStringContent(raw json.RawMessage) string {
@@ -1394,6 +2084,8 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 			textParts := []string{}
 			var toolCalls []any
 			var toolResult *map[string]any
+			imageParts := []any{}
+			toolResultImages := []any{}
 
 			for _, block := range c {
 				if b, ok := block.(map[string]any); ok {
@@ -1403,7 +2095,16 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 							textParts = append(textParts, t)
 						}
 					case "image":
-						// skip images
+						// Anthropic image block → OpenAI image_url part（不再丢弃）
+						// source 支持 base64 与 url 两种形态
+						if src, ok := b["source"].(map[string]any); ok {
+							if u := anthropicImageURL(src); u != "" {
+								imageParts = append(imageParts, map[string]any{
+									"type":      "image_url",
+									"image_url": map[string]any{"url": u},
+								})
+							}
+						}
 					case "tool_use":
 						argsStr := "{}"
 						if input, ok := b["input"]; ok && input != nil {
@@ -1423,9 +2124,36 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 						}
 						toolCalls = append(toolCalls, tc)
 					case "tool_result":
+						// content 可能是 string 或 blocks 数组 —— agent 客户端（Claude Code 等）的
+						// 图片通常包在 tool_result 里：文本进 tool 消息，图片提取到后续合成
+						// user 消息送上游，否则模型根本看不到图、只会反复调工具去"读图"
+						trContent := b["content"]
+						if blocks, ok := trContent.([]any); ok {
+							texts := []string{}
+							for _, blk := range blocks {
+								if bm, ok := blk.(map[string]any); ok {
+									switch bm["type"] {
+									case "text":
+										if t, ok := bm["text"].(string); ok {
+											texts = append(texts, t)
+										}
+									case "image":
+										if src, ok := bm["source"].(map[string]any); ok {
+											if u := anthropicImageURL(src); u != "" {
+												toolResultImages = append(toolResultImages, map[string]any{
+													"type":      "image_url",
+													"image_url": map[string]any{"url": u},
+												})
+											}
+										}
+									}
+								}
+							}
+							trContent = strings.Join(texts, "\n")
+						}
 						tr := map[string]any{
 							"role":         "tool",
-							"content":      b["content"],
+							"content":      trContent,
 							"tool_call_id": b["tool_use_id"],
 						}
 						toolResult = &tr
@@ -1442,6 +2170,21 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 				msgs = append(msgs, msg)
 			} else if m.Role == "user" && toolResult != nil {
 				msgs = append(msgs, *toolResult)
+				// tool_result 里的图片以合成 user 消息跟进（OpenAI tool 消息只收文本），
+				// 模型因此能直接看到图，不再靠工具调用绕路取图
+				if len(toolResultImages) > 0 {
+					parts := append([]any{map[string]any{"type": "text", "text": "[images returned by the tool call above]"}}, toolResultImages...)
+					msgs = append(msgs, map[string]any{"role": "user", "content": parts})
+					log.Printf("  anthropic: %d image(s) extracted from tool_result", len(toolResultImages))
+				}
+			} else if len(imageParts) > 0 {
+				// 带图消息：content 用 parts 数组（text part + image_url parts），保序：先文后图
+				parts := make([]any, 0, len(textParts)+len(imageParts))
+				for _, t := range textParts {
+					parts = append(parts, map[string]any{"type": "text", "text": t})
+				}
+				parts = append(parts, imageParts...)
+				msgs = append(msgs, map[string]any{"role": m.Role, "content": parts})
 			} else {
 				content := strings.Join(textParts, "\n")
 				msgs = append(msgs, map[string]any{"role": m.Role, "content": content})
@@ -1532,6 +2275,31 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 		if um, ok := u.(map[string]any); ok {
 			usage["input_tokens"] = um["prompt_tokens"]
 			usage["output_tokens"] = um["completion_tokens"]
+			// 缓存字段映射：Anthropic 客户端（Claude Code 等）靠 cache_read_input_tokens
+			// 展示缓存命中率，缺了会永远显示 0% 缓存
+			cached := int64(0)
+			readUsage := func(keys ...string) int64 {
+				for _, key := range keys {
+					if v, ok := um[key].(float64); ok && v >= 0 {
+						return int64(v)
+					}
+				}
+				return 0
+			}
+			if details, ok := um["prompt_tokens_details"].(map[string]any); ok {
+				if v, ok := details["cached_tokens"].(float64); ok && v >= 0 {
+					cached = int64(v)
+				}
+			}
+			if cached == 0 {
+				cached = readUsage("cache_read_input_tokens", "prompt_cache_hit_tokens")
+			}
+			if cached > 0 {
+				usage["cache_read_input_tokens"] = cached
+			}
+			if cc := readUsage("cache_creation_input_tokens"); cc > 0 {
+				usage["cache_creation_input_tokens"] = cc
+			}
 		}
 	}
 	out["usage"] = usage
@@ -1572,6 +2340,14 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 
 	reqLog := RequestLog{StartedAt: time.Now(), Protocol: "anthropic", Model: req.Model, Stream: req.Stream}
+
+	// 裸名付费 zen 模型回退到 Cline Pass 同名模型（与 chat 端点一致）
+	if alt := maybeAliasToClinePass(req.Model); alt != "" {
+		log.Printf("  anthropic alias: %s -> %s (paid opencode, available via Cline Pass)", req.Model, alt)
+		req.Model = alt
+		openAIReq["model"] = alt
+		reqLog.Model = alt
+	}
 
 	// 按 model 自动分流（与 chat 端点一致）：zen 免费/付费拒绝/Cline 池
 	switch routeModel(req.Model) {
@@ -1892,15 +2668,21 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, acc *
 		}
 	}
 
+	streamUsage := map[string]any{
+		"input_tokens":  latestUsage.Prompt,
+		"output_tokens": latestUsage.Completion,
+	}
+	// 缓存字段：Anthropic 客户端靠 cache_read_input_tokens 展示缓存命中率
+	if latestUsage.Cached > 0 {
+		streamUsage["cache_read_input_tokens"] = latestUsage.Cached
+	}
 	emit("message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 		},
-		"usage": map[string]any{
-			"output_tokens": latestUsage.Completion,
-		},
+		"usage": streamUsage,
 	})
 	recordTokenUsage(acc, reqLog.Model, latestUsage)
 	finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, true, "")

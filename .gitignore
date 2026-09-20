@@ -30,3 +30,6 @@ build/bin/
 
 # wails frontend scaffolding leftovers
 frontend/wailsjs/
+
+# local cross-compile output
+dist/

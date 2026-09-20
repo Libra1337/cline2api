@@ -65,7 +65,7 @@ func responsesInputToMessages(input any) []any {
 				if role == "" {
 					role = "user"
 				}
-				msgs = append(msgs, map[string]any{"role": role, "content": stringifyResponsesContent(m["content"])})
+				msgs = append(msgs, map[string]any{"role": role, "content": responsesContentToChat(m["content"])})
 			case "function_call":
 				callID, _ := m["call_id"].(string)
 				if callID == "" {
@@ -129,6 +129,47 @@ func stringifyResponsesContent(content any) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
+}
+
+// responsesContentToChat 把 Responses 内容转成 chat content：
+// 纯文本返回 string；含 input_image 时返回 parts 数组（text + image_url，保序），
+// 否则图片会被 stringifyResponsesContent 静默丢掉，模型只能靠工具调用去取图。
+func responsesContentToChat(content any) any {
+	blocks, ok := content.([]any)
+	if !ok {
+		return stringifyResponsesContent(content)
+	}
+	hasImage := false
+	for _, b := range blocks {
+		if bm, ok := b.(map[string]any); ok && bm["type"] == "input_image" {
+			hasImage = true
+			break
+		}
+	}
+	if !hasImage {
+		return stringifyResponsesContent(content)
+	}
+	parts := make([]any, 0, len(blocks))
+	for _, b := range blocks {
+		bm, ok := b.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch bm["type"] {
+		case "input_text", "text":
+			if t, ok := bm["text"].(string); ok && t != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": t})
+			}
+		case "input_image":
+			if u, ok := bm["image_url"].(string); ok && u != "" {
+				parts = append(parts, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": u},
+				})
+			}
+		}
+	}
+	return parts
 }
 
 // responsesToolsToChat 扁平 function 工具 → OpenAI 嵌套格式。
@@ -479,6 +520,15 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	chat := responsesToChat(params)
 	chatModel, _ := chat["model"].(string)
+
+	// 裸名付费 zen 模型回退到 Cline Pass 同名模型（与 chat 端点一致）
+	if alt := maybeAliasToClinePass(chatModel); alt != "" {
+		log.Printf("  responses alias: %s -> %s (paid opencode, available via Cline Pass)", chatModel, alt)
+		chat["model"] = alt
+		chatModel = alt
+		reqLog.Model = alt
+	}
+
 	route := routeModel(chatModel)
 
 	switch route {
