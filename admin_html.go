@@ -374,6 +374,10 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
     </div>
   </div>
   <div class="metric-section">
+    <div class="metric-heading">Cline Pass 用量限额 <span style="font-weight:400;font-size:11px;color:var(--text2)">· 官方订阅数据 · 60s 缓存</span></div>
+    <div id="usageLimits" style="display:grid;gap:10px"><div class="empty" id="usageLoading">加载中…</div></div>
+  </div>
+  <div class="metric-section">
     <div class="metric-heading">opencode 免费模型 · 今日用量</div>
     <div class="cards tokens">
       <div class="card yellow">
@@ -1226,7 +1230,7 @@ document.querySelectorAll('.nav-item').forEach(el => {
     document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
     _('tab-' + el.dataset.tab).style.display = 'block';
     if (el.dataset.tab === 'dashboard') { applyLang();
-loadStats(); loadAccounts(); }
+loadStats(); loadAccounts(); loadUsage(); }
     if (el.dataset.tab === 'accounts') loadAccounts();
     if (el.dataset.tab === 'logs') loadRequestLogs(true);
     if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); loadOcConfig(); }
@@ -1239,7 +1243,7 @@ function switchTab(name) {
   });
   document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
   _('tab-' + name).style.display = 'block';
-  if (name === 'dashboard') { loadStats(); loadAccounts(); }
+  if (name === 'dashboard') { loadStats(); loadAccounts(); loadUsage(); }
   if (name === 'accounts') loadAccounts();
   if (name === 'logs') loadRequestLogs(true);
   if (name === 'settings') { loadKeys(); loadModels(); loadOcConfig(); }
@@ -1326,6 +1330,43 @@ async function loadStats() {
     if (s.version) _('settingVersion').value = s.version;
     if (s.strategy) _('settingStrategy').value = s.strategy;
   } catch (e) { /* ignore */ }
+}
+
+// ========== Cline Pass 用量限额（官方订阅数据） ==========
+async function loadUsage() {
+  const box = _('usageLimits');
+  if (!box) return;
+  try {
+    const d = await api('GET', '/usage');
+    const list = (d.data && d.data.accounts) || [];
+    if (!list.length) { box.innerHTML = '<div class="empty">没有账号</div>'; return; }
+    const typeLabel = { five_hour: '5 小时', weekly: '本周', monthly: '本月' };
+    const barColor = p => p >= 90 ? '#e74c3c' : (p >= 70 ? '#f39c12' : 'var(--accent)');
+    box.innerHTML = list.map(a => {
+      if (a.error) {
+        return '<div class="card" style="padding:12px 16px"><div class="mono" style="font-size:12px">' + esc(a.email) + '</div>' +
+          '<div style="color:#e74c3c;font-size:12px;margin-top:4px">⚠ ' + esc(a.error) + '</div></div>';
+      }
+      const bars = (a.limits || []).map(l => {
+        const pct = l.percentUsed || 0;
+        const reset = l.resetsAt ? new Date(l.resetsAt) : null;
+        const resetStr = reset && !isNaN(reset) ? reset.toLocaleString() : '';
+        return '<div style="margin-top:8px">' +
+          '<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text2)">' +
+            '<span>' + (typeLabel[l.type] || esc(l.type)) + '</span>' +
+            '<span class="mono">' + pct + '%' + (resetStr ? ' · 重置 ' + resetStr : '') + '</span>' +
+          '</div>' +
+          '<div style="height:6px;border-radius:3px;background:var(--surface2);margin-top:3px;overflow:hidden">' +
+            '<div style="height:100%;width:' + Math.min(pct, 100) + '%;background:' + barColor(pct) + ';border-radius:3px"></div>' +
+          '</div></div>';
+      }).join('');
+      return '<div class="card" style="padding:12px 16px">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center">' +
+          '<div class="mono" style="font-size:12px">' + esc(a.email) + '</div>' +
+          (a.plan ? '<span class="model-tag" style="font-size:10px;padding:1px 8px">' + esc(a.plan) + '</span>' : '') +
+        '</div>' + (bars || '<div class="empty" style="padding:6px 0">无限额数据</div>') + '</div>';
+    }).join('');
+  } catch (e) { box.innerHTML = '<div class="empty">⚠ ' + esc(e.message) + '</div>'; }
 }
 
 // ========== 账号管理 ==========

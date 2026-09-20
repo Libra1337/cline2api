@@ -92,6 +92,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/config/update", auth(handleAdminUpdateConfig))
 	mux.HandleFunc("/admin/api/password", auth(handleAdminPassword))
 	mux.HandleFunc("/admin/api/request-logs", auth(handleAdminRequestLogs))
+	mux.HandleFunc("/admin/api/usage", auth(handleAdminUsage))
 	mux.HandleFunc("/admin/api/open-external", auth(handleOpenExternal))
 }
 
