@@ -223,26 +223,26 @@ type providerPin struct {
 	slug  string // 上游 provider slug
 }
 
-// modelProviderPins 模型 → 官方上游固定映射。key 为去掉 cline-pass/ 前缀后的模型 ID。
-// 实测（__probe__ 双字段探测 + finalProvider 验证，2026-09-20）：
-//   - glm-5.3：Vercel 管线，gateway.only 生效，finalProvider=zai
+// modelProviderPins 模型 → 官方上游固定映射。key 为去掉 cline-pass/ / cline-free/ 前缀、
+// 或任意厂商前缀后的裸模型 ID。
+// 实测（__probe__ 双字段探测 + finalProvider 验证）：
 //   - glm-5.3-flash：OpenRouter 管线，provider.only 生效，响应顶层 provider=Z.AI
 //   - deepseek-v4.1-flash：两字段均被忽略 —— 上游原生走 DeepSeek 官方 API
 //     （响应带 provider_metadata.deepseek.promptCache* 官方特征），无需也无法 pin
 //   - cline-pass/deepseek-v4-pro：openai-compatible-private 私有通道（唯一出口），无需 pin
 //   - muse-spark-1.3-contributor：OpenRouter 管线，当前唯一 provider=meta（官方）。
-//     今天 pin 是 no-op，但若未来 OpenRouter 加第三方 provider，默认路由会悄悄打散缓存——固定住。
-//     实测：缓存预热慢（3+ 发）+ 随机驱逐；输出需 max_tokens≥512（加密思维链烧预算）。
-//   - mimo-v2.5 / mimo-v2.5-pro：OpenRouter 管线，6~7 家 provider（xiaomi 官方 +
-//     gmicloud/deepinfra/novita/streamlake/venice 等第三方）。默认路由飘第三方打散缓存。
-//     实测 xiaomi 官方：冷一发后稳定 832/892（93%/发），零错误——固定官方。
-//     （novita/streamlake 矩阵中首发出高命中系跨 provider 共享缓存的假象，新前缀验证归零。）
-//   - qwen3.7-max / qwen3.7-plus：Vercel 网关管线，唯一 provider=alibaba（官方），
-//     finalProvider=alibaba。实测该端点无前缀缓存（TTL 曲线与增长对话全程 0%）。
-//   - qwen3.8-max：openai-compatible-private 私有通道（与 deepseek-v4-pro 同路），
-//     字段全忽略无需 pin。缓存慢热型：写入延迟 ~45-60s，之后 95-100%。
+//     pin 为未来防护（防第三方加入）。实测：缓存多副本本地化 ~50%/3s、≥30s 全灭；
+//     输出需 max_tokens≥512（加密思维链烧预算）。
+//   - mimo-v2.5 / mimo-v2.5-pro：OpenRouter 管线，6~7 家 provider。实测 xiaomi 官方
+//     冷一发后稳定 93%/发、TTL≥5min、零错误——固定官方。
+//   - qwen3.7-max / qwen3.7-plus：Vercel 网关唯一 provider=alibaba（官方）。实测该
+//     端点无前缀缓存（全程 0%）。qwen3.8-max 私有通道慢热型（45-60s 后 95-100%）。
+//   - glm-5.3：⚠️ 2026-09-21 上游回归——providerOptions.gateway.only 对该模型不再生效
+//     （仅/order 变体、三账号交叉验证全部静默忽略），zai 无法选择。默认路由上游侧
+//     锁定 baseten 且稳定；实测 baseten 缓存 95~97%/发、TTL≥5min（优于 zai 时代的
+//     间歇驱逐）。故不 pin，靠上游默认粘性 + 会话亲和保缓存。若上游恢复字段支持，
+//     加回 {"glm-5.3": {field:"gateway", slug:"zai"}} 即可。
 var modelProviderPins = map[string]providerPin{
-	"glm-5.3":                    {field: "gateway", slug: "zai"},
 	"glm-5.3-flash":              {field: "direct", slug: "z-ai"},
 	"muse-spark-1.3-contributor": {field: "direct", slug: "meta"},
 	"mimo-v2.5":                  {field: "direct", slug: "xiaomi"},

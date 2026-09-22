@@ -3,8 +3,9 @@ package main
 import "testing"
 
 // TestBuildUpstreamBodyGatewayPin: Vercel/planner 管线模型注入 providerOptions.gateway.only
+// （glm-5.3 因上游撤回字段支持已移出 pin 表，改用 qwen3.7-max 验证 gateway 形态注入）
 func TestBuildUpstreamBodyGatewayPin(t *testing.T) {
-	for _, model := range []string{"cline-pass/glm-5.3", "glm-5.3"} {
+	for _, model := range []string{"cline-pass/qwen3.7-max", "qwen3.7-max"} {
 		body := buildUpstreamBody(map[string]any{"model": model}, false)
 		gw, ok := body["providerOptions"].(map[string]any)
 		if !ok {
@@ -15,12 +16,20 @@ func TestBuildUpstreamBodyGatewayPin(t *testing.T) {
 			t.Fatalf("model %s: providerOptions.gateway missing: %v", model, gw)
 		}
 		only, _ := inner["only"].([]string)
-		if len(only) != 1 || only[0] != "zai" {
-			t.Fatalf("model %s: want only=[zai], got %v", model, inner["only"])
+		if len(only) != 1 || only[0] != "alibaba" {
+			t.Fatalf("model %s: want only=[alibaba], got %v", model, inner["only"])
 		}
 		if _, has := body["provider"]; has {
 			t.Fatalf("model %s: direct pin leaked into gateway model", model)
 		}
+	}
+	// glm-5.3 不再注入任何 pin（上游 2026-09-21 起忽略 gateway.only，默认路由已锁 baseten）
+	body := buildUpstreamBody(map[string]any{"model": "cline-pass/glm-5.3"}, false)
+	if _, has := body["providerOptions"]; has {
+		t.Fatal("glm-5.3: gateway pin should no longer be injected")
+	}
+	if _, has := body["provider"]; has {
+		t.Fatal("glm-5.3: direct pin should not be injected")
 	}
 }
 
@@ -126,8 +135,10 @@ func TestLookupProviderPinBoundary(t *testing.T) {
 	if _, ok := lookupProviderPin("cline-pass/deepseek-v4.1-flash"); ok {
 		t.Fatal("deepseek-v4.1-flash should not be pinned (both fields ignored upstream)")
 	}
-	if pin, ok := lookupProviderPin("cline-pass/glm-5.3"); !ok || pin.slug != "zai" {
-		t.Fatalf("glm-5.3 pin: ok=%v pin=%+v", ok, pin)
+	// glm-5.3：2026-09-21 上游撤回 gateway.only 支持（zai 不可选），默认路由上游侧锁
+	// baseten 且缓存实测 95%+ —— 不 pin，字段若恢复再加回
+	if _, ok := lookupProviderPin("cline-pass/glm-5.3"); ok {
+		t.Fatal("glm-5.3 should not be pinned (gateway.only ignored upstream since 2026-09-21)")
 	}
 	if pin, ok := lookupProviderPin("cline-free/muse-spark-1.3-contributor"); !ok || pin.field != "direct" || pin.slug != "meta" {
 		t.Fatalf("muse pin: ok=%v pin=%+v", ok, pin)
@@ -137,8 +148,8 @@ func TestLookupProviderPinBoundary(t *testing.T) {
 	if pin, ok := lookupProviderPin("z-ai/glm-5.3-flash"); !ok || pin.field != "direct" || pin.slug != "z-ai" {
 		t.Fatalf("vendor-prefix pin miss: ok=%v pin=%+v", ok, pin)
 	}
-	if pin, ok := lookupProviderPin("deepseek/glm-5.3"); !ok || pin.slug != "zai" {
-		t.Fatalf("generic suffix pin miss: ok=%v pin=%+v", ok, pin)
+	if _, ok := lookupProviderPin("deepseek/glm-5.3"); ok {
+		t.Fatal("glm-5.3 unpinned: vendor suffix should not match either")
 	}
 	if _, ok := lookupProviderPin("moonshotai/kimi-k3"); ok {
 		t.Fatal("unrelated vendor-prefixed model should not match")
