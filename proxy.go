@@ -698,6 +698,16 @@ func startProxy(host string, port int) error {
 		}
 
 		if isStream {
+			var retryErr error
+			resp, acc, retryErr = retryStreamOnInitialError(params, resp, acc)
+			if retryErr != nil {
+				log.Printf("  api error: %v", retryErr)
+				finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, retryErr.Error())
+				writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error": map[string]string{"message": retryErr.Error(), "type": "api_error"},
+				})
+				return
+			}
 			handleStreamResponse(w, resp, acc, &reqLog)
 		} else {
 			handleNonStreamResponse(w, resp, acc, &reqLog)
@@ -1284,6 +1294,98 @@ func clineHeaders(token, sessionID string) http.Header {
 	}
 
 	return h
+}
+
+// peekSSEFirstEvent 从上游 SSE body 读取首个 data: 事件（跳过注释/空行），不消耗其余内容。
+// 返回首个事件的 payload 与「已读字节 + 剩余 body」的组合 reader（Close 会传导到原 body）；
+// 无 data 事件（EOF 等）时 payload 为空。用于在建流失败（HTTP 200 + 首事件为 error）时
+// 于提交响应头之前重试上游。
+func peekSSEFirstEvent(body io.ReadCloser) ([]byte, io.ReadCloser) {
+	var consumed []byte
+	reader := bufio.NewReader(body)
+	for {
+		line, err := reader.ReadString('\n')
+		consumed = append(consumed, []byte(line)...)
+		if strings.HasPrefix(line, "data:") {
+			payload := strings.TrimSpace(line[5:])
+			buffered, _ := reader.Peek(reader.Buffered())
+			return []byte(payload), &prefixBody{
+				prefix: consumed,
+				rest:   &bodyWithClose{r: io.MultiReader(bytes.NewReader(buffered), body), body: body},
+			}
+		}
+		if err != nil || len(consumed) > 64*1024 {
+			// EOF / 首事件异常超长：放弃窥探直接透传已读内容
+			return nil, &prefixBody{prefix: consumed, rest: body}
+		}
+	}
+}
+
+// bodyWithClose 让组合 reader 的 Close 传导到原始 body，避免连接泄漏。
+type bodyWithClose struct {
+	r    io.Reader
+	body io.Closer
+}
+
+func (b *bodyWithClose) Read(p []byte) (int, error) { return b.r.Read(p) }
+func (b *bodyWithClose) Close() error               { return b.body.Close() }
+
+// prefixBody 把窥探阶段已读的字节重新拼回 body 前部。
+type prefixBody struct {
+	prefix []byte
+	rest   io.ReadCloser
+	done   bool
+}
+
+func (p *prefixBody) Read(b []byte) (int, error) {
+	if !p.done {
+		if len(p.prefix) > 0 {
+			n := copy(b, p.prefix)
+			p.prefix = p.prefix[n:]
+			return n, nil
+		}
+		p.done = true
+	}
+	return p.rest.Read(b)
+}
+
+func (p *prefixBody) Close() error { return p.rest.Close() }
+
+// sseErrorPayload 判断 SSE 首事件是否为上游错误事件（stream_initialization_failed 等）。
+func sseErrorPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		return false
+	}
+	_, hasErr := obj["error"]
+	return hasErr
+}
+
+// retryStreamOnInitialError 首事件缓冲 + 建流失败单次重试：
+// 上游部分错误以 HTTP 200 + SSE error 首事件返回（meta/muse 等多副本端点的间歇性建流失败），
+// 一旦把响应头写给客户端就再无退路。这里在提交响应头之前窥探首事件——
+// 是错误事件就关闭本次上游、原参数重试一次；是正常数据则把窥探字节拼回后正常开流。
+// 重试也失败时原 body 已关，返回错误由调用方走错误响应路径。
+func retryStreamOnInitialError(params map[string]any, resp *http.Response, acc *Account) (*http.Response, *Account, error) {
+	payload, combined := peekSSEFirstEvent(resp.Body)
+	if !sseErrorPayload(payload) {
+		resp.Body = combined
+		return resp, acc, nil
+	}
+	var errObj map[string]any
+	json.Unmarshal(payload, &errObj)
+	log.Printf("  upstream stream init error (retry once): %s", truncate(fmt.Sprint(errObj["error"]), 300))
+	combined.Close()
+
+	resp2, acc2, err := callClineAPI(params, true)
+	if err != nil {
+		return nil, acc, fmt.Errorf("stream init failed, retry also failed: %w", err)
+	}
+	log.Printf("  stream retry: new upstream established")
+	return resp2, acc2, nil
 }
 
 type clineAPIError struct {
@@ -2498,6 +2600,16 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
+		var retryErr error
+		resp, acc, retryErr = retryStreamOnInitialError(openAIReq, resp, acc)
+		if retryErr != nil {
+			log.Printf("  anthropic api error: %v", retryErr)
+			finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, retryErr.Error())
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]string{"message": retryErr.Error(), "type": "api_error"},
+			})
+			return
+		}
 		handleAnthropicStream(w, resp, acc, &reqLog)
 	} else {
 		var raw map[string]any
