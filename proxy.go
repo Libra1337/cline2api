@@ -233,10 +233,16 @@ type providerPin struct {
 //   - muse-spark-1.3-contributor：OpenRouter 管线，当前唯一 provider=meta（官方）。
 //     今天 pin 是 no-op，但若未来 OpenRouter 加第三方 provider，默认路由会悄悄打散缓存——固定住。
 //     实测：缓存预热慢（3+ 发）+ 随机驱逐；输出需 max_tokens≥512（加密思维链烧预算）。
+//   - mimo-v2.5 / mimo-v2.5-pro：OpenRouter 管线，6~7 家 provider（xiaomi 官方 +
+//     gmicloud/deepinfra/novita/streamlake/venice 等第三方）。默认路由飘第三方打散缓存。
+//     实测 xiaomi 官方：冷一发后稳定 832/892（93%/发），零错误——固定官方。
+//     （novita/streamlake 矩阵中首发出高命中系跨 provider 共享缓存的假象，新前缀验证归零。）
 var modelProviderPins = map[string]providerPin{
-	"glm-5.3":                    {field: "gateway", slug: "zai"},
-	"glm-5.3-flash":              {field: "direct", slug: "z-ai"},
-	"muse-spark-1.3-contributor": {field: "direct", slug: "meta"},
+	"glm-5.3":                      {field: "gateway", slug: "zai"},
+	"glm-5.3-flash":                {field: "direct", slug: "z-ai"},
+	"muse-spark-1.3-contributor":   {field: "direct", slug: "meta"},
+	"mimo-v2.5":                    {field: "direct", slug: "xiaomi"},
+	"mimo-v2.5-pro":                {field: "direct", slug: "xiaomi"},
 }
 
 // lookupProviderPin 按完整模型 ID 查 pin；未命中时依次尝试去掉

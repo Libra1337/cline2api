@@ -143,6 +143,15 @@ func TestLookupProviderPinBoundary(t *testing.T) {
 	if _, ok := lookupProviderPin("moonshotai/kimi-k3"); ok {
 		t.Fatal("unrelated vendor-prefixed model should not match")
 	}
+	if pin, ok := lookupProviderPin("cline-pass/mimo-v2.5"); !ok || pin.field != "direct" || pin.slug != "xiaomi" {
+		t.Fatalf("mimo pin: ok=%v pin=%+v", ok, pin)
+	}
+	if pin, ok := lookupProviderPin("xiaomi/mimo-v2.5-pro"); !ok || pin.slug != "xiaomi" {
+		t.Fatalf("mimo-pro vendor-prefix pin: ok=%v pin=%+v", ok, pin)
+	}
+	if _, ok := lookupProviderPin("mimo-v2.5-free"); ok {
+		t.Fatal("free variant is a distinct model, should not inherit pin")
+	}
 }
 
 // TestBumpMaxTokensForRetry: 空响应重试的预算提升规则
