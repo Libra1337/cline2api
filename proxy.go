@@ -237,12 +237,18 @@ type providerPin struct {
 //     gmicloud/deepinfra/novita/streamlake/venice 等第三方）。默认路由飘第三方打散缓存。
 //     实测 xiaomi 官方：冷一发后稳定 832/892（93%/发），零错误——固定官方。
 //     （novita/streamlake 矩阵中首发出高命中系跨 provider 共享缓存的假象，新前缀验证归零。）
+//   - qwen3.7-max / qwen3.7-plus：Vercel 网关管线，唯一 provider=alibaba（官方），
+//     finalProvider=alibaba。实测该端点无前缀缓存（TTL 曲线与增长对话全程 0%）。
+//   - qwen3.8-max：openai-compatible-private 私有通道（与 deepseek-v4-pro 同路），
+//     字段全忽略无需 pin。缓存慢热型：写入延迟 ~45-60s，之后 95-100%。
 var modelProviderPins = map[string]providerPin{
-	"glm-5.3":                      {field: "gateway", slug: "zai"},
-	"glm-5.3-flash":                {field: "direct", slug: "z-ai"},
-	"muse-spark-1.3-contributor":   {field: "direct", slug: "meta"},
-	"mimo-v2.5":                    {field: "direct", slug: "xiaomi"},
-	"mimo-v2.5-pro":                {field: "direct", slug: "xiaomi"},
+	"glm-5.3":                    {field: "gateway", slug: "zai"},
+	"glm-5.3-flash":              {field: "direct", slug: "z-ai"},
+	"muse-spark-1.3-contributor": {field: "direct", slug: "meta"},
+	"mimo-v2.5":                  {field: "direct", slug: "xiaomi"},
+	"mimo-v2.5-pro":              {field: "direct", slug: "xiaomi"},
+	"qwen3.7-max":                {field: "gateway", slug: "alibaba"},
+	"qwen3.7-plus":               {field: "gateway", slug: "alibaba"},
 }
 
 // lookupProviderPin 按完整模型 ID 查 pin；未命中时依次尝试去掉

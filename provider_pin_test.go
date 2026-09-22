@@ -152,6 +152,15 @@ func TestLookupProviderPinBoundary(t *testing.T) {
 	if _, ok := lookupProviderPin("mimo-v2.5-free"); ok {
 		t.Fatal("free variant is a distinct model, should not inherit pin")
 	}
+	if pin, ok := lookupProviderPin("cline-pass/qwen3.7-max"); !ok || pin.field != "gateway" || pin.slug != "alibaba" {
+		t.Fatalf("qwen3.7-max pin: ok=%v pin=%+v", ok, pin)
+	}
+	if pin, ok := lookupProviderPin("alibaba/qwen3.7-plus"); !ok || pin.slug != "alibaba" {
+		t.Fatalf("qwen3.7-plus vendor-prefix pin: ok=%v pin=%+v", ok, pin)
+	}
+	if _, ok := lookupProviderPin("cline-pass/qwen3.8-max"); ok {
+		t.Fatal("qwen3.8-max is private-channel single-exit, should not be pinned")
+	}
 }
 
 // TestBumpMaxTokensForRetry: 空响应重试的预算提升规则
